@@ -67,6 +67,7 @@ import validator from 'validator';
 import { getConfig } from '../config';
 import { getLogger } from '../context';
 import { DatabaseMode, getDatabasePool } from '../database';
+import { recordHistogramValue } from '../otel/otel';
 import { getRedis } from '../redis';
 import { r4ProjectId } from '../seed';
 import {
@@ -109,7 +110,9 @@ import {
   periodToRangeString,
 } from './sql';
 import { getBinaryStorage } from './storage';
-import { recordHistogramValue } from '../otel/otel';
+
+const transactionAttempts = 2;
+const retryableTransactionErrorCodes = ['40001'];
 
 /**
  * The RepositoryContext interface defines standard metadata for repository actions.
@@ -1060,6 +1063,7 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
 
         const result = await this.updateResourceImpl(resource, false);
         const durationMs = Date.now() - startTime;
+
         await this.postCommit(async () => {
           this.logEvent(PatchInteraction, AuditEventOutcome.Success, undefined, { resource: result, durationMs });
         });
@@ -2168,18 +2172,31 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
     callback: (client: PoolClient) => Promise<TResult>,
     options?: { serializable: boolean }
   ): Promise<TResult> {
-    try {
-      const client = await this.beginTransaction(options?.serializable ? 'SERIALIZABLE' : undefined);
-      const result = await callback(client);
-      await this.commitTransaction();
-      return result;
-    } catch (err) {
-      const operationOutcomeError = normalizeDatabaseError(err);
-      await this.rollbackTransaction(operationOutcomeError);
-      throw operationOutcomeError;
-    } finally {
-      this.endTransaction();
+    let error: OperationOutcomeError | undefined;
+    for (let i = 0; i < transactionAttempts; i++) {
+      try {
+        const client = await this.beginTransaction(options?.serializable ? 'SERIALIZABLE' : undefined);
+        const result = await callback(client);
+        await this.commitTransaction();
+        return result;
+      } catch (err) {
+        const operationOutcomeError = normalizeDatabaseError(err);
+        // Assigning here and throwing below is necessary to satisfy TypeScript
+        error = operationOutcomeError;
+
+        // Ensure transaction is rolled back before attempting any retry
+        await this.rollbackTransaction(operationOutcomeError);
+        if (!this.isRetryableTransactionError(operationOutcomeError)) {
+          break; // Fall through to throw statement outside of the loop
+        }
+      } finally {
+        this.endTransaction();
+      }
     }
+
+    // Cannot be undefined: either the function returns normally from the `try` block,
+    // or `error` is assigned at top of `catch` block before reaching this line
+    throw error;
   }
 
   private async beginTransaction(isolationLevel: TransactionIsolationLevel = 'REPEATABLE READ'): Promise<PoolClient> {
@@ -2264,6 +2281,34 @@ export class Repository extends FhirRepository<PoolClient> implements Disposable
     for (const cb of callbacks) {
       await cb();
     }
+  }
+
+  /**
+   * Checks whether an error represents a serialization conflict that can safely be retried.
+   * NOTE: Retrying a transaction must be done in full: the entire `Repository.withTransaction()` block
+   * should be re-executed, in a new transaction.
+   * @param err - The error to check.
+   * @returns True if the error indicates a retryable transaction failure.
+   */
+  private isRetryableTransactionError(err: OperationOutcomeError): boolean {
+    if (this.transactionDepth) {
+      // Nested transactions (i.e. savepoints) are NOT retryable per the Postgres docs;
+      // the entire transaction must have been rolled back before anything can be retried:
+      // "It is important to retry the complete transaction, including all logic
+      // that decides which SQL to issue and/or which values to use"
+      // @see https://www.postgresql.org/docs/16/mvcc-serialization-failure-handling.html
+      return false;
+    }
+    if (err.outcome.issue.length !== 1) {
+      // Multiple errors combined cannot be guaranteed to be retryable
+      return false;
+    }
+
+    const issue = err.outcome.issue[0];
+    return Boolean(
+      issue.code === 'conflict' &&
+        issue.details?.coding?.some((c) => retryableTransactionErrorCodes.includes(c.code as string))
+    );
   }
 
   /**
